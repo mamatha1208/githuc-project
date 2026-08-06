@@ -1,0 +1,206 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [ main ]
+  push:
+    branches: [ main ]
+
+# Cancel superseded runs on the same ref to save CI minutes
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# Least-privilege by default; individual jobs elevate only what they need
+permissions:
+  contents: read
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}   # e.g. ghcr.io/org/repo
+
+jobs:
+  test:
+    name: Test (pytest)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+          if [ -f requirements-dev.txt ]; then pip install -r requirements-dev.txt; fi
+          # Fallback: install project + test extras if using pyproject.toml
+          if [ -f pyproject.toml ] && [ ! -f requirements.txt ]; then pip install -e ".[test]" || pip install -e .; fi
+          pip install pytest
+
+      - name: Run tests
+        run: pytest --maxfail=1 --disable-warnings -q
+
+  docker-build:
+    name: Build Docker image
+    runs-on: ubuntu-latest
+    # Only build the image once tests pass
+    needs: test
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          push: false
+          load: true
+          tags: myapp:ci-${{ github.sha }}
+          # Use GitHub Actions cache to speed up repeated builds
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # --- Runs only on a merge to main (not on PRs) ---
+  scan-and-publish:
+    name: Scan & push image (GHCR)
+    runs-on: ubuntu-latest
+    needs: docker-build
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    permissions:
+      contents: read
+      packages: write   # push to GHCR
+      id-token: write   # OIDC token, needed for keyless signing / cloud login
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build image (local, for scanning)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          push: false
+          load: true
+          tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Scan image with Trivy
+        uses: aquasecurity/trivy-action@0.24.0
+        with:
+          image-ref: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+          format: table
+          # Fail the job if any CRITICAL vulnerability is found.
+          # Add HIGH here too if you want a stricter gate.
+          severity: CRITICAL
+          exit-code: "1"
+          ignore-unfixed: true   # don't fail on CVEs with no available fix
+
+      # Only reached if the scan step above exits 0 (no criticals)
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          # GITHUB_TOKEN is short-lived and auto-issued per run — never a
+          # hardcoded credential, and it's scoped by the `packages: write`
+          # permission above.
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Push image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # --- Terraform-applies the deploy, gated behind a protected Environment.
+  # The "production" Environment must have a required reviewer configured in
+  # GitHub Settings (see notes below) — this job will pause and wait for
+  # approval before it runs, even though it's queued automatically on every
+  # merge to main.
+  deploy:
+    name: Deploy to Azure Container Apps
+    runs-on: ubuntu-latest
+    needs: scan-and-publish
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    environment:
+      name: production
+      url: ${{ steps.tf-outputs.outputs.app_url }}
+    permissions:
+      contents: read
+      id-token: write   # required for OIDC login to Azure — no client secret
+    defaults:
+      run:
+        working-directory: infra/environments/prod
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Azure login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.7.5"
+
+      - name: Terraform init
+        run: terraform init -input=false
+        env:
+          ARM_USE_OIDC: "true"
+          ARM_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          ARM_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          ARM_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Terraform plan
+        run: |
+          terraform plan -input=false -out=tfplan \
+            -var="container_image_tag=${{ github.sha }}"
+        env:
+          ARM_USE_OIDC: "true"
+          ARM_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          ARM_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          ARM_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Terraform apply
+        run: terraform apply -input=false -auto-approve tfplan
+        env:
+          ARM_USE_OIDC: "true"
+          ARM_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          ARM_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          ARM_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Capture outputs
+        id: tf-outputs
+        run: |
+          echo "app_url=https://$(terraform output -raw container_app_fqdn)" >> "$GITHUB_OUTPUT"
+          echo "revision=$(terraform output -raw latest_revision_name)" >> "$GITHUB_OUTPUT"
+
+      - name: Summary
+        run: |
+          echo "### Deployed :rocket:" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Image: \`${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Revision: \`${{ steps.tf-outputs.outputs.revision }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- URL: ${{ steps.tf-outputs.outputs.app_url }}" >> "$GITHUB_STEP_SUMMARY"
