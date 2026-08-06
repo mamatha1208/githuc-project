@@ -1,158 +1,127 @@
-name: CI
+name: ci
 
 on:
   pull_request:
-    branches: [ main ]
+    branches: [main]
   push:
-    branches: [ main ]
+    branches: [main]
 
-# Cancel superseded runs on the same ref to save CI minutes
-concurrency:
-  group: ci-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
-
-# Least-privilege by default; individual jobs elevate only what they need
 permissions:
   contents: read
 
-env:
-  REGISTRY: ghcr.io
-  IMAGE_NAME: ${{ github.repository }}   # e.g. ghcr.io/org/repo
-
 jobs:
+  # Runs on every PR and every push to main.
   test:
-    name: Test (pytest)
+    name: Test
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
           cache: "pip"
+          cache-dependency-path: app/requirements.txt
 
       - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
-          if [ -f requirements-dev.txt ]; then pip install -r requirements-dev.txt; fi
-          # Fallback: install project + test extras if using pyproject.toml
-          if [ -f pyproject.toml ] && [ ! -f requirements.txt ]; then pip install -e ".[test]" || pip install -e .; fi
-          pip install pytest
+        run: pip install -r app/requirements.txt
 
-      - name: Run tests
-        run: pytest --maxfail=1 --disable-warnings -q
+      - name: Run unit tests
+        run: pytest app/ -v
 
-  docker-build:
-    name: Build Docker image
-    runs-on: ubuntu-latest
-    # Only build the image once tests pass
+  # Runs on every PR and every push to main - proves the image builds cleanly
+  # before we ever try to ship it anywhere.
+  build:
+    name: Build image
     needs: test
+    runs-on: ubuntu-latest
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+      - uses: docker/setup-buildx-action@v3
 
       - name: Build image
         uses: docker/build-push-action@v6
         with:
           context: .
-          file: ./Dockerfile
           push: false
+          tags: widget-api:${{ github.sha }}
           load: true
-          tags: myapp:ci-${{ github.sha }}
-          # Use GitHub Actions cache to speed up repeated builds
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
 
-  # --- Runs only on a merge to main (not on PRs) ---
-  scan-and-publish:
-    name: Scan & push image (GHCR)
-    runs-on: ubuntu-latest
-    needs: docker-build
+      - name: Save image for downstream jobs
+        run: docker save widget-api:${{ github.sha }} -o /tmp/widget-api.tar
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: widget-api-image
+          path: /tmp/widget-api.tar
+          retention-days: 1
+
+  # Only on merge to main: scan for vulnerabilities and push to GHCR.
+  # Uses the built-in GITHUB_TOKEN (OIDC-backed, short-lived) instead of a
+  # long-lived PAT or hardcoded credential.
+  scan-and-push:
+    name: Scan and push
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: build
+    runs-on: ubuntu-latest
     permissions:
       contents: read
-      packages: write   # push to GHCR
-      id-token: write   # OIDC token, needed for keyless signing / cloud login
+      packages: write
+    outputs:
+      image: ${{ steps.meta.outputs.image }}
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      - name: Build image (local, for scanning)
-        uses: docker/build-push-action@v6
+      - uses: actions/download-artifact@v4
         with:
-          context: .
-          file: ./Dockerfile
-          push: false
-          load: true
-          tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          name: widget-api-image
+          path: /tmp
 
-      - name: Scan image with Trivy
+      - name: Load image
+        run: docker load -i /tmp/widget-api.tar
+
+      - name: Scan image with Trivy (fail on criticals)
         uses: aquasecurity/trivy-action@0.24.0
         with:
-          image-ref: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+          image-ref: widget-api:${{ github.sha }}
           format: table
-          # Fail the job if any CRITICAL vulnerability is found.
-          # Add HIGH here too if you want a stricter gate.
           severity: CRITICAL
           exit-code: "1"
-          ignore-unfixed: true   # don't fail on CVEs with no available fix
+          ignore-unfixed: true
 
-      # Only reached if the scan step above exits 0 (no criticals)
       - name: Log in to GHCR
         uses: docker/login-action@v3
         with:
-          registry: ${{ env.REGISTRY }}
+          registry: ghcr.io
           username: ${{ github.actor }}
-          # GITHUB_TOKEN is short-lived and auto-issued per run — never a
-          # hardcoded credential, and it's scoped by the `packages: write`
-          # permission above.
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Push image
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          file: ./Dockerfile
-          push: true
-          tags: |
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+      - name: Tag and push
+        id: meta
+        run: |
+          IMAGE="ghcr.io/${GITHUB_REPOSITORY,,}/widget-api"
+          docker tag widget-api:${{ github.sha }} "$IMAGE:${{ github.sha }}"
+          docker tag widget-api:${{ github.sha }} "$IMAGE:latest"
+          docker push "$IMAGE:${{ github.sha }}"
+          docker push "$IMAGE:latest"
+          echo "image=$IMAGE" >> "$GITHUB_OUTPUT"
 
-  # --- Terraform-applies the deploy, gated behind a protected Environment.
-  # The "production" Environment must have a required reviewer configured in
-  # GitHub Settings (see notes below) — this job will pause and wait for
-  # approval before it runs, even though it's queued automatically on every
-  # merge to main.
+  # Only on merge to main, only after a human approves the "production"
+  # GitHub Environment. Authenticates to Azure via OIDC (no client secret
+  # stored anywhere) and applies the Terraform in infra/.
   deploy:
-    name: Deploy to Azure Container Apps
-    runs-on: ubuntu-latest
-    needs: scan-and-publish
+    name: Deploy to Azure
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: scan-and-push
+    runs-on: ubuntu-latest
     environment:
       name: production
-      url: ${{ steps.tf-outputs.outputs.app_url }}
     permissions:
+      id-token: write
       contents: read
-      id-token: write   # required for OIDC login to Azure — no client secret
-    defaults:
-      run:
-        working-directory: infra/environments/prod
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
       - name: Azure login (OIDC)
         uses: azure/login@v2
@@ -161,46 +130,22 @@ jobs:
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
-      - name: Set up Terraform
-        uses: hashicorp/setup-terraform@v3
-        with:
-          terraform_version: "1.7.5"
+      - uses: hashicorp/setup-terraform@v3
 
       - name: Terraform init
-        run: terraform init -input=false
-        env:
-          ARM_USE_OIDC: "true"
-          ARM_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
-          ARM_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
-          ARM_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
-
-      - name: Terraform plan
+        working-directory: infra
         run: |
-          terraform plan -input=false -out=tfplan \
-            -var="container_image_tag=${{ github.sha }}"
-        env:
-          ARM_USE_OIDC: "true"
-          ARM_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
-          ARM_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
-          ARM_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+          terraform init \
+            -backend-config="resource_group_name=${{ secrets.TFSTATE_RESOURCE_GROUP }}" \
+            -backend-config="storage_account_name=${{ secrets.TFSTATE_STORAGE_ACCOUNT }}" \
+            -backend-config="container_name=tfstate" \
+            -backend-config="key=servicelink-widget-api.tfstate"
 
       - name: Terraform apply
-        run: terraform apply -input=false -auto-approve tfplan
-        env:
-          ARM_USE_OIDC: "true"
-          ARM_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
-          ARM_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
-          ARM_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
-
-      - name: Capture outputs
-        id: tf-outputs
+        working-directory: infra
         run: |
-          echo "app_url=https://$(terraform output -raw container_app_fqdn)" >> "$GITHUB_OUTPUT"
-          echo "revision=$(terraform output -raw latest_revision_name)" >> "$GITHUB_OUTPUT"
-
-      - name: Summary
-        run: |
-          echo "### Deployed :rocket:" >> "$GITHUB_STEP_SUMMARY"
-          echo "- Image: \`${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}\`" >> "$GITHUB_STEP_SUMMARY"
-          echo "- Revision: \`${{ steps.tf-outputs.outputs.revision }}\`" >> "$GITHUB_STEP_SUMMARY"
-          echo "- URL: ${{ steps.tf-outputs.outputs.app_url }}" >> "$GITHUB_STEP_SUMMARY"
+          terraform apply -auto-approve \
+            -var="image_tag=${{ github.sha }}" \
+            -var="ghcr_owner=${{ github.repository_owner }}" \
+            -var="ghcr_username=${{ github.actor }}" \
+            -var="ghcr_token=${{ secrets.GITHUB_TOKEN }}"
